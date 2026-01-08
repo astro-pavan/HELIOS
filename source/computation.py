@@ -824,6 +824,92 @@ class Compute(object):
 
         cuda.Context.synchronize()
 
+    def apply_rainout(self, quant):
+        """
+        Custom Physics: Manabe-Wetherald Rainout (Fixed Relative Humidity).
+        Updates H2O mixing ratio based on current T_lay.
+        FIXED: Handles shape mismatch between T_lay (nlayer + 1) and P_lay (nlayer).
+        """
+
+        # 1. Fetch data from GPU
+        try:
+            T_lay = quant.dev_T_lay.get()
+            P_lay = quant.dev_p_lay.get()
+        except AttributeError:
+            T_lay = quant.dev_T_lay
+            P_lay = quant.dev_p_lay
+
+        # 2. MATCH SHAPES
+        # T_lay often has 1 extra element (the surface temp) at the end.
+        # P_lay only has the atmospheric layers.
+        # We slice T_lay to match P_lay's size.
+        if T_lay.shape[0] > P_lay.shape[0]:
+            n_layers = P_lay.shape[0]
+            T_calc = T_lay[:n_layers] # Use only atmospheric temps
+        else:
+            T_calc = T_lay
+
+        # 3. Find Water Species
+        h2o_species = None
+        for spec in quant.species_list:
+            if "H2O" in spec.name or "1H2-16O" in spec.name:
+                h2o_species = spec
+                break
+        
+        if h2o_species is not None:
+
+            # --- SAFEGUARD 1: Check for Valid Pressure ---
+            P_surf = P_lay[0] # Assuming Index 0 is Surface (High P)
+            
+            # If P_surf is zero or NaN (e.g. initialization step), abort to avoid crash
+            if P_surf <= 1e-10 or np.isnan(P_surf):
+                return
+
+            # 4. Calculate Saturation (Using the sliced T_calc)
+            # August-Roche-Magnus formula
+            T_cel = T_calc - 273.15
+            T_cel = np.maximum(T_cel, -100.0) 
+            
+            # Result in hPa
+            Psat_hPa = 6.1094 * np.exp((17.625 * T_cel) / (T_cel + 243.04))
+            
+            # Convert to Barye
+            Psat_cgs = Psat_hPa * 1000.0
+            
+            # 5. Calculate Saturation Mixing Ratio
+            # Now shapes match: (25,) / (25,)
+            P_lay_safe = np.where(P_lay == 0, 1e-10, P_lay)
+            P_surf = P_lay[0]
+            Q = P_lay / P_surf
+
+            # Linear drop from 0.77 (Surface) to 0.0 (Top)
+            # The 0.02 is a small offset to prevent negative values at TOA
+            RH_surf = 0.5
+            RH_profile = RH_surf * ( (Q - 0.02) / (1.0 - 0.02) )
+
+            # Clip to ensure valid RH between 0 and 1
+            RH_profile = np.maximum(RH_profile, 1e-6)
+
+            x_sat = (RH_profile * Psat_cgs) / P_lay_safe
+            # 6. Apply Cold Trap
+            # Min of (Reservoir, Saturation)
+            new_vmr = np.minimum(0.1, x_sat)
+            
+            # Stratospheric limit (start from bottom layer up)
+            # We iterate backwards through the array
+            for i in range(len(new_vmr) - 1):
+                # If Upper layer (i+1) > Lower layer (i), force Upper = Lower
+                if new_vmr[i+1] > new_vmr[i]:
+                    new_vmr[i+1] = new_vmr[i]
+
+            # --- SAFEGUARD 2: Check for NaNs ---
+            if np.any(np.isnan(new_vmr)):
+                print("[WARNING] NaN detected in water profile. Skipping update.")
+                return
+
+            # 7. Update HELIOS
+            h2o_species.vmr_layer = new_vmr.astype(quant.fl_prec)
+
     def radiation_loop(self, quant, write, read, rt_plot):
         """ loops over the relevant kernels iteratively until the equilibrium TP - profile reached """
 
@@ -864,6 +950,7 @@ class Compute(object):
                     self.interpolate_meanmolmass(quant)
                 elif quant.opacity_mixing == "on-the-fly":
                     hsfunc.calculate_vmr_for_all_species(quant)
+                    self.apply_rainout(quant) # ADDED RAINOUT
                     hsfunc.calculate_meanmolecularmass(quant)
                     hsfunc.nullify_opac_scat_arrays(quant)
                     self.calculate_total_opacity_and_scat_cross_sections_from_species(quant)
@@ -1048,6 +1135,7 @@ class Compute(object):
                         self.interpolate_meanmolmass(quant)
                     elif quant.opacity_mixing == "on-the-fly":
                         hsfunc.calculate_vmr_for_all_species(quant)
+                        self.apply_rainout(quant) # ADDED RAINOUT
                         hsfunc.calculate_meanmolecularmass(quant)
 
                 self.interpolate_kappa_and_cp(quant)
@@ -1071,6 +1159,7 @@ class Compute(object):
                         self.interpolate_meanmolmass(quant)
                     elif quant.opacity_mixing == "on-the-fly":
                         hsfunc.calculate_vmr_for_all_species(quant)
+                        self.apply_rainout(quant) # ADDED RAINOUT
                         hsfunc.calculate_meanmolecularmass(quant)
                         hsfunc.nullify_opac_scat_arrays(quant)
                         self.calculate_total_opacity_and_scat_cross_sections_from_species(quant)
@@ -1100,6 +1189,7 @@ class Compute(object):
                 quant.kappa_lay = quant.dev_kappa_lay.get()
                 if quant.iso == 0:
                     quant.kappa_int = quant.dev_kappa_int.get()
+                hsfunc.apply_moist_physics(quant) # ADDED MOIST PHYSICS
                 quant.T_lay = quant.dev_T_lay.get()
 
                 # mark convection zone. used by realtime plotting

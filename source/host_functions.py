@@ -30,6 +30,34 @@ from pycuda.compiler import SourceModule
 from source import phys_const as pc
 
 
+def get_moist_gradient(T, P):
+    """ Calculates Moist Adiabatic Gradient (dlnT/dlnP)_moist """
+    R_d = 287.05; L_v = 2.5e6; cp_d = 1005.0; epsilon = 0.622
+
+    T_cel = T - 273.15
+    if T_cel < -100: return R_d / cp_d 
+
+    es_Pa = 6.1094 * np.exp((17.625 * T_cel) / (T_cel + 243.04)) * 100.0
+    P_Pa = P / 10.0
+    P_dry = max(P_Pa - es_Pa, 1.0) 
+    r_s = (epsilon * es_Pa) / P_dry
+
+    numerator = 1.0 + (L_v * r_s) / (R_d * T)
+    denominator = 1.0 + (L_v**2 * r_s * epsilon) / (cp_d * R_d * T**2)
+    
+    nabla_dry = R_d / cp_d
+    nabla_moist = nabla_dry * (numerator / denominator)
+    return min(max(nabla_moist, 0.05), nabla_dry)
+
+def apply_moist_physics(quant):
+    """ Overwrites kappa with moist gradient """
+    for i in range(quant.nlayer):
+        quant.kappa_lay[i] = get_moist_gradient(quant.T_lay[i], quant.p_lay[i])
+    limit = min(len(quant.kappa_int), len(quant.T_int))
+    for i in range(limit):
+         quant.kappa_int[i] = get_moist_gradient(quant.T_int[i], quant.p_int[i])
+
+
 def planet_param(quant, read):
     """ sets the planetary, stellar and orbital parameters and converts them to the correct units """
 
@@ -511,6 +539,8 @@ def convective_adjustment(quant):
 
     iter = 0
 
+    apply_moist_physics(quant) # ADDED MOIST CONVECTION
+
     conv_check(quant)
     unstable_found = sum(quant.conv_unstable) > 0
 
@@ -540,7 +570,6 @@ def convective_adjustment(quant):
     ### uncomment for debugging
     # sys.stdout.write("Adjusting temperatures: {:6s}\r".format("DONE"))
     # sys.stdout.flush()
-
 
 def mark_convective_layers(quant, stitching):
     """ marks the layers where convection dominates over radiative transfer """
