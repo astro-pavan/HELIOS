@@ -583,9 +583,9 @@ def mark_convective_layers(quant, stitching):
         if quant.p_lay[i] <= 1e1:  # ignore top atmosphere, since artificial/numerical temperature peaks might occur there
             break
 
-        T_in_between_lim = quant.T_lay[i] * (quant.p_int[i + 1] / quant.p_lay[i]) ** (quant.kappa_lay[i] * (1 - 1e-3))
+        T_in_between_lim = quant.T_lay[i] * (quant.p_int[i + 1] / quant.p_lay[i]) ** (quant.kappa_lay[i] * (1 - 1e-6))
 
-        T_ad_lim = T_in_between_lim * (quant.p_lay[i + 1] / quant.p_int[i + 1]) ** (quant.kappa_int[i + 1] * (1 - 1e-3))
+        T_ad_lim = T_in_between_lim * (quant.p_lay[i + 1] / quant.p_int[i + 1]) ** (quant.kappa_int[i + 1] * (1 - 1e-6))
 
         if quant.T_lay[i+1] < T_ad_lim:
             quant.conv_layer[i] = 1
@@ -599,7 +599,7 @@ def mark_convective_layers(quant, stitching):
             quant.conv_layer[i] = 0
 
     # do the surface/BOA condition
-    T_ad_lim = quant.T_lay[quant.nlayer] * (quant.p_lay[0] / quant.p_int[0]) ** (quant.kappa_int[0] * (1 - 1e-3))
+    T_ad_lim = quant.T_lay[quant.nlayer] * (quant.p_lay[0] / quant.p_int[0]) ** (quant.kappa_int[0] * (1 - 1e-6))
 
     if quant.T_lay[0] < T_ad_lim:
         quant.conv_layer[quant.nlayer] = 1
