@@ -24,6 +24,8 @@ import numpy as np
 from scipy import interpolate as itp
 from source import tools as tls
 
+import os
+
 
 class Cloud(object):
     """ class that reads in cloud parameters to be used in the HELIOS code """
@@ -79,7 +81,7 @@ class Cloud(object):
 
         return pdf
 
-    def calc_weighted_cross_sections_with_pdf_and_interpolate_wavelengths(self, nr, quant):
+    def calc_weighted_cross_sections_with_pdf_and_interpolate_wavelengths_old(self, nr, quant):
 
         # reset for each cloud
         weighted_abs_cross_mie = []
@@ -106,6 +108,110 @@ class Cloud(object):
 
         for l in range(len(self.lamda_mie)):
 
+            abs_cross = sum(abs_cross_per_r[:, l] * pdf * delta_r)
+            scat_cross = sum(scat_cross_per_r[:, l] * pdf * delta_r)
+            g_0 = sum(scat_cross_per_r[:, l] * pdf * delta_r)
+
+            weighted_abs_cross_mie.append(abs_cross)
+            weighted_scat_cross_mie.append(scat_cross)
+            weighted_g_0_mie.append(g_0)
+
+        # interpolate to HELIOS wavelength grid
+        self.abs_cross_one_cloud = tls.convert_spectrum(self.lamda_mie, weighted_abs_cross_mie, quant.opac_wave, int_lambda=quant.opac_interwave, type='log')
+        self.scat_cross_one_cloud = tls.convert_spectrum(self.lamda_mie, weighted_scat_cross_mie, quant.opac_wave, int_lambda=quant.opac_interwave, type='log')
+        self.g_0_one_cloud = tls.convert_spectrum(self.lamda_mie, weighted_g_0_mie, quant.opac_wave, int_lambda=quant.opac_interwave, type='linear')
+
+    def calc_weighted_cross_sections_with_pdf_and_interpolate_wavelengths(self, nr, quant):
+        import os
+
+        # ==============================================================================
+        # PARAMETER RESOLUTION (Fixing the Command-Line Disconnect)
+        # ==============================================================================
+        
+        # --- 1. Resolve Radius (r_mode) ---
+        try:
+            # Try getting it from the Cloud object's list (Standard File Mode)
+            r_mode = self.cloud_r_mode[nr]
+        except (IndexError, TypeError, AttributeError):
+            # Fallback: Look in 'quant' for command-line argument '-aerosol_radius'
+            if hasattr(quant, 'aerosol_radius'):
+                r_mode = quant.aerosol_radius
+            else:
+                r_mode = 11.0 # Default safety fallback
+                print("WARNING: Could not find aerosol radius. Using default 11.0 micron.")
+
+        # --- 2. Resolve Sigma (cloud_r_std_dev) ---
+        try:
+            # Try getting it from the Cloud object's list
+            sigma = self.cloud_r_std_dev[nr]
+        except (IndexError, TypeError, AttributeError):
+            # Fallback: Look in 'quant' for command-line argument '-aerosol_sigma'
+            if hasattr(quant, 'aerosol_sigma'):
+                sigma = quant.aerosol_sigma
+            else:
+                sigma = 2.0 # Default safety fallback
+                print("WARNING: Could not find aerosol sigma. Using default 2.0.")
+
+        # --- 3. Resolve Path (mie_path) ---
+        try:
+            # Try getting it from the Cloud object's list
+            path = self.mie_path[nr]
+        except (IndexError, TypeError, AttributeError):
+            # Fallback: Look in 'quant' for command-line argument '-path_mie'
+            if hasattr(quant, 'path_mie'):
+                path = quant.path_mie
+            # Some versions might store it as 'mie_path' in quant
+            elif hasattr(quant, 'mie_path'):
+                path = quant.mie_path
+            else:
+                raise ValueError("Could not find path to Mie files in arguments!")
+
+        # ==============================================================================
+        # LOGIC
+        # ==============================================================================
+
+        # --- Check for Single File Mode ---
+        # If the path points directly to a file (e.g., "output/water.mie"), use it.
+        if os.path.isfile(path):
+            print(f"Cloud Deck {nr}: Detected single Mie file ('{path}'). Using monodisperse approximation.")
+            
+            # Read the single file directly
+            self.lamda_mie, scat_cross, abs_cross, g_0 = self.read_mie_file(path)
+            
+            # Interpolate directly to HELIOS grid
+            self.abs_cross_one_cloud = tls.convert_spectrum(self.lamda_mie, abs_cross, quant.opac_wave, int_lambda=quant.opac_interwave, type='log')
+            self.scat_cross_one_cloud = tls.convert_spectrum(self.lamda_mie, scat_cross, quant.opac_wave, int_lambda=quant.opac_interwave, type='log')
+            self.g_0_one_cloud = tls.convert_spectrum(self.lamda_mie, g_0, quant.opac_wave, int_lambda=quant.opac_interwave, type='linear')
+            
+            return # Done!
+
+        # --- Directory Mode (Original Logic) ---
+        # This only runs if you provided a directory path
+        
+        # reset for each cloud
+        weighted_abs_cross_mie = []
+        weighted_scat_cross_mie = []
+        weighted_g_0_mie = []
+
+        r_values = 10 ** np.arange(-2, 3.1, 0.1)  # Particle sizes (microns)
+        delta_r = r_values * (10**0.05 - 10**-0.05)
+
+        # calc pdf using the resolved r_mode and sigma
+        pdf = self.lognorm_pdf(r_values, r_mode, sigma)
+
+        # get lamda values from the first file in the directory
+        self.lamda_mie, _, _, _ = self.read_mie_file(path + "r{:.6f}.dat".format(r_values[0]))
+
+        abs_cross_per_r = np.zeros((len(r_values), len(self.lamda_mie)))
+        scat_cross_per_r = np.zeros((len(r_values), len(self.lamda_mie)))
+        g_0_per_r = np.zeros((len(r_values), len(self.lamda_mie)))
+
+        for r in range(len(r_values)):
+            # Construct filename from directory path
+            fname = path + "r{:.6f}.dat".format(r_values[r])
+            _, scat_cross_per_r[r, :], abs_cross_per_r[r, :], g_0_per_r[r, :] = self.read_mie_file(fname)
+
+        for l in range(len(self.lamda_mie)):
             abs_cross = sum(abs_cross_per_r[:, l] * pdf * delta_r)
             scat_cross = sum(scat_cross_per_r[:, l] * pdf * delta_r)
             g_0 = sum(scat_cross_per_r[:, l] * pdf * delta_r)
@@ -149,9 +255,10 @@ class Cloud(object):
 
         elif self.cloud_mixing_ratio_setting == "file":
 
-            cloud_file = np.genfromtxt(self.cloud_vmr_file, names=True, dtype=None, skip_header=self.cloud_vmr_file_header_lines)
+            cloud_file = np.genfromtxt(self.cloud_vmr_file, names=True, dtype=None, skip_header=self.cloud_vmr_file_header_lines, unpack=True)
 
-            press_orig = cloud_file[self.cloud_file_press_name]
+            # press_orig = cloud_file[self.cloud_file_press_name]
+            press_orig = cloud_file[0]
 
             if self.cloud_file_press_units == "Pa":
 
@@ -161,7 +268,7 @@ class Cloud(object):
 
                 press_orig *= 1e6
 
-            f_cloud_orig = cloud_file[self.cloud_file_species_name[nr]]
+            f_cloud_orig = cloud_file[nr + 1]
 
             log_press_orig = [np.log10(p) for p in press_orig]
             log_p_lay = [np.log10(p) for p in quant.p_lay]

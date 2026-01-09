@@ -884,8 +884,9 @@ class Compute(object):
 
             # Linear drop from 0.77 (Surface) to 0.0 (Top)
             # The 0.02 is a small offset to prevent negative values at TOA
-            RH_surf = 0.5
-            RH_profile = RH_surf * ( (Q - 0.02) / (1.0 - 0.02) )
+            RH_surf = 0.77
+            # RH_profile = RH_surf * ( (Q - 0.02) / (1.0 - 0.02) )
+            RH_profile = np.full_like(Q, RH_surf)
 
             # Clip to ensure valid RH between 0 and 1
             RH_profile = np.maximum(RH_profile, 1e-6)
@@ -893,7 +894,7 @@ class Compute(object):
             x_sat = (RH_profile * Psat_cgs) / P_lay_safe
             # 6. Apply Cold Trap
             # Min of (Reservoir, Saturation)
-            new_vmr = np.minimum(0.1, x_sat)
+            new_vmr = np.minimum(1.0, x_sat)
             
             # Stratospheric limit (start from bottom layer up)
             # We iterate backwards through the array
@@ -909,6 +910,106 @@ class Compute(object):
 
             # 7. Update HELIOS
             h2o_species.vmr_layer = new_vmr.astype(quant.fl_prec)
+
+    def radiation_with_partial_clouds(self, quant):
+        """ does the raditaive calculation with partial clouds"""
+
+        if quant.clouds == 1:
+                
+            # Copying cloud opacity and scattering
+            real_scat_cloud = quant.dev_scat_cross_all_clouds_lay.get()
+            real_abs_cloud  = quant.dev_abs_cross_all_clouds_lay.get()
+            real_g0_cloud   = quant.dev_g_0_all_clouds_lay.get()
+
+            # Temporary cloud switch off
+            quant.clouds = np.int32(0)
+
+            # Setting cloud opacity and scattering to clear
+            quant.dev_scat_cross_all_clouds_lay.fill(0.0)
+            quant.dev_abs_cross_all_clouds_lay.fill(0.0)
+            quant.dev_g_0_all_clouds_lay.fill(0.0)
+
+            self.calculate_transmission(quant)
+            if quant.clouds == 0:
+                self.calculate_direct_beamflux(quant)
+            
+            # Solve Fluxes (Clear)
+            if quant.flux_calc_method == "iteration":
+                self.populate_spectral_flux_iteratively(quant)
+            elif quant.flux_calc_method == "matrix":
+                self.solve_for_spectral_fluxes_via_matrix(quant)
+            
+            # Integrate to get Net Flux (F_net)
+            self.integrate_flux(quant)
+
+            # Save Clear Fluxes to CPU
+            F_net_clear  = quant.dev_F_net.get()
+            F_up_clear   = quant.dev_F_up_tot.get()
+            F_down_clear = quant.dev_F_down_tot.get()
+            F_diff_clear = quant.dev_F_net_diff.get() # Needed for convergence check
+
+            # Clouds are switched back on
+
+            quant.clouds = np.int32(1)
+
+            # Adding cloud opacity and scattering back
+            quant.dev_scat_cross_all_clouds_lay = gpuarray.to_gpu(real_scat_cloud)
+            quant.dev_abs_cross_all_clouds_lay  = gpuarray.to_gpu(real_abs_cloud)
+            quant.dev_g_0_all_clouds_lay        = gpuarray.to_gpu(real_g0_cloud)
+            
+            # Recalculate Cloud Optical Properties (since we moved this out of the %10 block)
+            self.calc_total_g_0_of_gas_and_clouds(quant)
+            
+            # Calculate Transmission & Beam (Cloudy Physics)
+            self.calculate_transmission(quant)
+            self.calculate_direct_beamflux(quant)
+            
+            # Solve Fluxes (Cloudy)
+            if quant.flux_calc_method == "iteration":
+                self.populate_spectral_flux_iteratively(quant)
+            elif quant.flux_calc_method == "matrix":
+                self.solve_for_spectral_fluxes_via_matrix(quant)
+            
+            # Integrate to get Net Flux
+            self.integrate_flux(quant)
+            
+            # Get Cloudy Fluxes
+            F_net_cloud  = quant.dev_F_net.get()
+            F_up_cloud   = quant.dev_F_up_tot.get()
+            F_down_cloud = quant.dev_F_down_tot.get()
+            F_diff_cloud = quant.dev_F_net_diff.get()
+
+            # Combine cloudy and clear fluxes
+
+            f = quant.cloud_fraction
+            
+            # Weighted Average
+            F_net_avg  = (1.0 - f) * F_net_clear  + (f) * F_net_cloud
+            F_up_avg   = (1.0 - f) * F_up_clear   + (f) * F_up_cloud
+            F_down_avg = (1.0 - f) * F_down_clear + (f) * F_down_cloud
+            F_diff_avg = (1.0 - f) * F_diff_clear + (f) * F_diff_cloud
+            
+            # Push Averaged Fluxes back to GPU for the Temperature Stepper
+            quant.dev_F_net = gpuarray.to_gpu(F_net_avg)
+            quant.dev_F_up_tot = gpuarray.to_gpu(F_up_avg)
+            quant.dev_F_down_tot = gpuarray.to_gpu(F_down_avg)
+            quant.dev_F_net_diff = gpuarray.to_gpu(F_diff_avg)
+            
+            # Update Host Variables (Optional, for plotting/debug)
+            quant.F_net = F_net_avg
+
+        else:
+
+            if quant.flux_calc_method == "iteration":
+                self.populate_spectral_flux_iteratively(quant)
+            elif quant.flux_calc_method == "matrix":  # note: matrix method only works with scattering
+                self.solve_for_spectral_fluxes_via_matrix(quant)
+            else:
+                print("Flux calculation method unclear. Check parameter file for typos. Aborting...")
+                raise SystemExit()
+
+            self.integrate_flux(quant)
+
 
     def radiation_loop(self, quant, write, read, rt_plot):
         """ loops over the relevant kernels iteratively until the equilibrium TP - profile reached """
@@ -934,6 +1035,9 @@ class Compute(object):
 
         start_total.record()
 
+        if quant.clouds == 1:
+            quant.cloud_fraction = 0.6
+
         while condition1 and condition2 and condition3:
 
             if quant.iter_value % 100 == 0:
@@ -957,22 +1061,16 @@ class Compute(object):
 
                 if quant.clouds == 1:
                     self.calc_total_g_0_of_gas_and_clouds(quant)
-                self.calculate_transmission(quant)
+                if quant.clouds == 0: 
+                    self.calculate_transmission(quant)
 
                 self.calculate_delta_z(quant)
                 quant.delta_z_lay = quant.dev_delta_z_lay.get()
                 hsfunc.calculate_height_z(quant)
                 quant.dev_z_lay = gpuarray.to_gpu(quant.z_lay)
                 self.calculate_direct_beamflux(quant)
-            if quant.flux_calc_method == "iteration":
-                self.populate_spectral_flux_iteratively(quant)
-            elif quant.flux_calc_method == "matrix":  # note: matrix method only works with scattering
-                self.solve_for_spectral_fluxes_via_matrix(quant)
-            else:
-                print("Flux calculation method unclear. Check parameter file for typos. Aborting...")
-                raise SystemExit()
 
-            self.integrate_flux(quant)
+            self.radiation_with_partial_clouds(quant)
 
             # uncomment for time testing purposes
             # start_test.record()
@@ -987,6 +1085,12 @@ class Compute(object):
                 quant.marked_red = np.zeros(quant.nlayer+1)
 
                 if quant.iter_value % 100 == 0:
+                    h2o_species = None
+                    for spec in quant.species_list:
+                        if "H2O" in spec.name or "1H2-16O" in spec.name:
+                            h2o_species = spec
+                            break
+                    print(h2o_species.vmr_layer)
                     print("\nWe are running \"" + quant.name + "\" at iteration step nr. : "+str(quant.iter_value))
                     if quant.iter_value > 99:
                         print("Time for the last 100 steps [s]: {:.2f}".format(time_loop * 1e-3))
@@ -1166,17 +1270,16 @@ class Compute(object):
 
                     if quant.clouds == 1:
                         self.calc_total_g_0_of_gas_and_clouds(quant)
-                    self.calculate_transmission(quant)
+                    if quant.clouds == 0: 
+                        self.calculate_transmission(quant)
+
                     self.calculate_delta_z(quant)
                     quant.delta_z_lay = quant.dev_delta_z_lay.get()
                     hsfunc.calculate_height_z(quant)
                     quant.dev_z_lay = gpuarray.to_gpu(quant.z_lay)
                     self.calculate_direct_beamflux(quant)
-                if quant.flux_calc_method == "iteration":
-                    self.populate_spectral_flux_iteratively(quant)
-                elif quant.flux_calc_method == "matrix":  # matrix method only works with scattering
-                    self.solve_for_spectral_fluxes_via_matrix(quant)
-                self.integrate_flux(quant)
+
+                self.radiation_with_partial_clouds(quant)
 
                 # copy back fluxes to determine convergence
                 quant.F_net = quant.dev_F_net.get()
@@ -1205,6 +1308,12 @@ class Compute(object):
                 condition = not(hsfunc.check_for_radiative_eq(quant)) or (quant.iter_value < 400) or (sum(quant.conv_layer) == 0)
 
                 if quant.iter_value % 100 == 1:
+                    h2o_species = None
+                    for spec in quant.species_list:
+                        if "H2O" in spec.name or "1H2-16O" in spec.name:
+                            h2o_species = spec
+                            break
+                    print(h2o_species.vmr_layer)
                     hsfunc.give_feedback_on_convergence(quant)
 
                 # radiative forward stepping if local flux criterion not satisfied

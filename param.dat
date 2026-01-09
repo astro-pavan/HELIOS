@@ -73,12 +73,12 @@ planet =                                              GJ_1214b                  
 === === CLOUDS === ===
 
 number of cloud decks =                               0                               [number >= 0]                                (CL: Y)
-path to Mie files =                                   ./input/cloud1/ ./input/cloud2/ [directory path(s)]                          (CL: Y, only 1 cloud)
-aerosol radius mode [micron] =                        10   20                         [number(s) > 0]                              (CL: Y, only 1 cloud)
-aerosol radius geometric std dev =                    2    1.5                        [number(s) > 1]                              (CL: Y, only 1 cloud)
+path to Mie files =                                   ./input/cloud1/                 [directory path(s)]                          (CL: Y, only 1 cloud)
+aerosol radius mode [micron] =                        11                              [number(s) > 0]                              (CL: Y, only 1 cloud)
+aerosol radius geometric std dev =                    2                               [number(s) > 1]                              (CL: Y, only 1 cloud)
 cloud mixing ratio =                                  file                            [manual, file]                               (CL: Y)
   file   --> path to file with cloud data =           ./input/cloud_file.txt          [file path]                                  (CL: Y)
-  file   --> cloud file format =                      1 Pressure cgs                  [#skip, press.col., press.unit[cgs,Pa,bar]]  (CL: N)
+  file   --> cloud file format =                      0 Pressure bar                  [#skip, press.col., press.unit[cgs,Pa,bar]]  (CL: N)
   file   --> aerosol name =                           Aerosol1  Aerosol2              [name(s) of column(s) with cloud data]       (CL: Y, only 1 cloud)
   manual --> cloud bottom pressure [10^-6 bar] =      1e5       1e3                   [number(s) > 0]                              (CL: Y, only 1 cloud)
   manual --> cloud bottom mixing ratio =              1e-19     1e-19                 [number(s): 0 - 1]                           (CL: Y, only 1 cloud)
