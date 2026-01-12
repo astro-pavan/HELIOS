@@ -20,6 +20,7 @@
 # ==============================================================================
 
 import numpy as np
+np.set_printoptions(precision=3)
 import pycuda.driver as cuda
 import pycuda.autoinit
 import pycuda.gpuarray as gpuarray
@@ -828,7 +829,6 @@ class Compute(object):
         """
         Custom Physics: Manabe-Wetherald Rainout (Fixed Relative Humidity).
         Updates H2O mixing ratio based on current T_lay.
-        FIXED: Handles shape mismatch between T_lay (nlayer + 1) and P_lay (nlayer).
         """
 
         # 1. Fetch data from GPU
@@ -838,6 +838,11 @@ class Compute(object):
         except AttributeError:
             T_lay = quant.dev_T_lay
             P_lay = quant.dev_p_lay
+
+        P_dry_lay = np.array(quant.p_dry_lay)
+        P_dry_int = np.array(quant.p_dry_int)
+        
+        T_int = np.array(quant.T_int)
 
         # 2. MATCH SHAPES
         # T_lay often has 1 extra element (the surface temp) at the end.
@@ -849,6 +854,8 @@ class Compute(object):
         else:
             T_calc = T_lay
 
+        T_surf = T_lay[0]
+
         # 3. Find Water Species
         h2o_species = None
         for spec in quant.species_list:
@@ -858,43 +865,44 @@ class Compute(object):
         
         if h2o_species is not None:
 
-            # --- SAFEGUARD 1: Check for Valid Pressure ---
-            P_surf = P_lay[0] # Assuming Index 0 is Surface (High P)
-            
-            # If P_surf is zero or NaN (e.g. initialization step), abort to avoid crash
-            if P_surf <= 1e-10 or np.isnan(P_surf):
-                return
+            RH = np.minimum(quant.relative_humidity, 1)
 
             # 4. Calculate Saturation (Using the sliced T_calc)
             # August-Roche-Magnus formula
-            T_cel = T_calc - 273.15
-            T_cel = np.maximum(T_cel, -100.0) 
-            
-            # Result in hPa
-            Psat_hPa = 6.1094 * np.exp((17.625 * T_cel) / (T_cel + 243.04))
-            
-            # Convert to Barye
-            Psat_cgs = Psat_hPa * 1000.0
-            
-            # 5. Calculate Saturation Mixing Ratio
-            # Now shapes match: (25,) / (25,)
-            P_lay_safe = np.where(P_lay == 0, 1e-10, P_lay)
-            P_surf = P_lay[0]
-            Q = P_lay / P_surf
+            T_cel_lay = np.maximum(T_calc - 273.15, -100.0) 
+            Psat_hPa_lay = 6.1094 * np.exp((17.625 * T_cel_lay) / (T_cel_lay + 243.04))
+            Psat_cgs_lay = Psat_hPa_lay * 1000.0
+            P_h2o_lay = RH * Psat_cgs_lay
 
-            # Linear drop from 0.77 (Surface) to 0.0 (Top)
-            # The 0.02 is a small offset to prevent negative values at TOA
-            RH_surf = 0.77
-            # RH_profile = RH_surf * ( (Q - 0.02) / (1.0 - 0.02) )
-            RH_profile = np.full_like(Q, RH_surf)
+            T_cel_int = np.maximum(T_int - 273.15, -100.0) 
+            Psat_hPa_int = 6.1094 * np.exp((17.625 * T_cel_int) / (T_cel_int + 243.04))
+            Psat_cgs_int = Psat_hPa_int * 1000.0
+            P_h2o_int = RH * Psat_cgs_int
+            
+            # 5. Calculate Mixing Ratio
+            P_dry_lay = np.where(P_dry_lay == 0, 1e-10, P_dry_lay)
+            x_h2o_max = P_h2o_lay / P_dry_lay
 
-            # Clip to ensure valid RH between 0 and 1
-            RH_profile = np.maximum(RH_profile, 1e-6)
-
-            x_sat = (RH_profile * Psat_cgs) / P_lay_safe
             # 6. Apply Cold Trap
             # Min of (Reservoir, Saturation)
-            new_vmr = np.minimum(1.0, x_sat)
+
+            if quant.august_roche_magnus == 1:
+                new_vmr = np.minimum(1.0, x_h2o_max)
+            else:        
+                new_vmr = np.minimum(quant.x_h2o_start, x_h2o_max)
+                new_vmr = np.minimum(1.0, new_vmr)
+
+            # setting new pressure - CAUSES ERRORS
+            # quant.p_lay = quant.p_dry_lay * (1 + (P_h2o_lay/P_dry_lay))
+            # quant.p_int = quant.p_dry_int * (1 + (P_h2o_int/P_dry_int))
+
+            # quant.dev_p_int = gpuarray.to_gpu(quant.p_int.astype(quant.fl_prec))
+            # quant.dev_p_lay = gpuarray.to_gpu(quant.p_lay.astype(quant.fl_prec))
+
+            # delta_P = np.abs(quant.p_int[:-1] - quant.p_int[1:])
+            # new_colmass = delta_P / quant.g
+            # quant.col_den_lay = new_colmass
+            # quant.dev_delta_colmass = gpuarray.to_gpu(new_colmass.astype(quant.fl_prec))
             
             # Stratospheric limit (start from bottom layer up)
             # We iterate backwards through the array
@@ -911,51 +919,124 @@ class Compute(object):
             # 7. Update HELIOS
             h2o_species.vmr_layer = new_vmr.astype(quant.fl_prec)
 
+            P_bar_current = quant.p_int[0] / 1e6  # Convert CGS to bar
+            P_sat_bar = Psat_cgs_int[0] / 1e6
+            P_dry_bar = P_dry_int[0] / 1e6
+            
+            if quant.iter_value % 100 == 0:
+                print(new_vmr)
+                print(f"\n[Variable Pressure Debug] Iteration {quant.iter_value}")
+                print(f"  Surface Temp:   {T_lay[0]:.2f} K")
+                print(f"  x_H2O (Surf):   {x_h2o_max[0]:.4f}")
+                print(f"  P_H2O (Steam):  {P_sat_bar:.4f} bar")
+                print(f"  P_dry (Steam):  {P_dry_bar:.4f} bar")
+                print(f"  P_total (Surf): {P_bar_current:.4f} bar")
+
+                net_flux_toa = quant.dev_F_net.get()[-1]
+                print(f"  Net Flux TOA: {net_flux_toa:.4e} erg/s/cm2 (Pos=Cooling, Neg=Heating)")
+
+    def apply_temperature_dependent_clouds(self, quant):
+        """
+        Simple Parameterization: Clouds break up as Surface Temperature rises.
+        Based on transition seen in Schneider et al. (2019).
+        
+        Range:
+          - T < 298 K: Full Stratocumulus (Fraction = 1.0)
+          - T > 305 K: Scattered Cumulus (Fraction = 0.0 or 0.2)
+          - In-between: Linear ramp down.
+        """
+        
+        # 1. Get Surface Temperature
+        # HELIOS stores surface temp at the end of the T_lay array
+        try:
+            T_lay = quant.dev_T_lay.get()
+            T_surf = T_lay[quant.nlayer]
+        except:
+            return
+
+        # 2. Define Thresholds
+        # Paper baseline is 290 K (Clouds present) [cite: 31]
+        # Breakup starts near 298 K [cite: 146]
+        # Hot state is > 305 K [cite: 74]
+        
+        T_start_breakup = 298.0
+        T_full_breakup  = 305.0
+
+        reduction_factor = 0
+        
+        # 3. Calculate Target Fraction
+        if T_surf <= T_start_breakup:
+            reduction_factor = 0.0
+        elif T_surf >= T_full_breakup:
+            reduction_factor = 1.0 
+        else:
+            # Linear Interpolation
+            reduction_factor = (T_surf - T_start_breakup) / (T_full_breakup - T_start_breakup)
+
+        # 4. Apply Smoothing (Inertia)
+        # Prevents numerical shock if T oscillates slightly
+        # blend_rate = 1
+        # new_fraction = (1.0 - blend_rate) * quant.cloud_fraction + (blend_rate * target_fraction)
+        
+        # 5. Update
+        cloud_fraction = (1 - reduction_factor) * quant.cloud_fraction
+        quant.cloud_reduction_factor = reduction_factor
+
+        # 6. Debug Output
+        if quant.iter_value % 100 == 0:
+            print(f"\n[Cloud Temp Check] Iter: {quant.iter_value}")
+            print(f"  T_surf: {T_surf:.2f} K")
+            print(f"  Thresholds: Start={T_start_breakup} K, End={T_full_breakup} K")
+            # print(f"  Target Fraction: {target_fraction:.3f}")
+            print(f"  -> Actual Fraction: {cloud_fraction:.3f}")
+
     def radiation_with_partial_clouds(self, quant):
         """ does the raditaive calculation with partial clouds"""
 
         if quant.clouds == 1:
+            
+            if quant.cloud_fraction != 1:
+
+                # Copying cloud opacity and scattering
+                real_scat_cloud = quant.dev_scat_cross_all_clouds_lay.get()
+                real_abs_cloud  = quant.dev_abs_cross_all_clouds_lay.get()
+                real_g0_cloud   = quant.dev_g_0_all_clouds_lay.get()
+
+                # Temporary cloud switch off
+                quant.clouds = np.int32(0)
+
+                # Setting cloud opacity and scattering to clear
+                quant.dev_scat_cross_all_clouds_lay.fill(0.0)
+                quant.dev_abs_cross_all_clouds_lay.fill(0.0)
+                quant.dev_g_0_all_clouds_lay.fill(0.0)
+
+                self.calculate_transmission(quant)
+                if quant.clouds == 0:
+                    self.calculate_direct_beamflux(quant)
                 
-            # Copying cloud opacity and scattering
-            real_scat_cloud = quant.dev_scat_cross_all_clouds_lay.get()
-            real_abs_cloud  = quant.dev_abs_cross_all_clouds_lay.get()
-            real_g0_cloud   = quant.dev_g_0_all_clouds_lay.get()
+                # Solve Fluxes (Clear)
+                if quant.flux_calc_method == "iteration":
+                    self.populate_spectral_flux_iteratively(quant)
+                elif quant.flux_calc_method == "matrix":
+                    self.solve_for_spectral_fluxes_via_matrix(quant)
+                
+                # Integrate to get Net Flux (F_net)
+                self.integrate_flux(quant)
 
-            # Temporary cloud switch off
-            quant.clouds = np.int32(0)
+                # Save Clear Fluxes to CPU
+                F_net_clear  = quant.dev_F_net.get()
+                F_up_clear   = quant.dev_F_up_tot.get()
+                F_down_clear = quant.dev_F_down_tot.get()
+                F_diff_clear = quant.dev_F_net_diff.get() # Needed for convergence check
 
-            # Setting cloud opacity and scattering to clear
-            quant.dev_scat_cross_all_clouds_lay.fill(0.0)
-            quant.dev_abs_cross_all_clouds_lay.fill(0.0)
-            quant.dev_g_0_all_clouds_lay.fill(0.0)
+                # Clouds are switched back on
 
-            self.calculate_transmission(quant)
-            if quant.clouds == 0:
-                self.calculate_direct_beamflux(quant)
-            
-            # Solve Fluxes (Clear)
-            if quant.flux_calc_method == "iteration":
-                self.populate_spectral_flux_iteratively(quant)
-            elif quant.flux_calc_method == "matrix":
-                self.solve_for_spectral_fluxes_via_matrix(quant)
-            
-            # Integrate to get Net Flux (F_net)
-            self.integrate_flux(quant)
+                quant.clouds = np.int32(1)
 
-            # Save Clear Fluxes to CPU
-            F_net_clear  = quant.dev_F_net.get()
-            F_up_clear   = quant.dev_F_up_tot.get()
-            F_down_clear = quant.dev_F_down_tot.get()
-            F_diff_clear = quant.dev_F_net_diff.get() # Needed for convergence check
-
-            # Clouds are switched back on
-
-            quant.clouds = np.int32(1)
-
-            # Adding cloud opacity and scattering back
-            quant.dev_scat_cross_all_clouds_lay = gpuarray.to_gpu(real_scat_cloud)
-            quant.dev_abs_cross_all_clouds_lay  = gpuarray.to_gpu(real_abs_cloud)
-            quant.dev_g_0_all_clouds_lay        = gpuarray.to_gpu(real_g0_cloud)
+                # Adding cloud opacity and scattering back
+                quant.dev_scat_cross_all_clouds_lay = gpuarray.to_gpu(real_scat_cloud)
+                quant.dev_abs_cross_all_clouds_lay  = gpuarray.to_gpu(real_abs_cloud)
+                quant.dev_g_0_all_clouds_lay        = gpuarray.to_gpu(real_g0_cloud)
             
             # Recalculate Cloud Optical Properties (since we moved this out of the %10 block)
             self.calc_total_g_0_of_gas_and_clouds(quant)
@@ -981,13 +1062,20 @@ class Compute(object):
 
             # Combine cloudy and clear fluxes
 
-            f = quant.cloud_fraction
+            f = quant.cloud_fraction * (1 - quant.cloud_reduction_factor)
             
-            # Weighted Average
-            F_net_avg  = (1.0 - f) * F_net_clear  + (f) * F_net_cloud
-            F_up_avg   = (1.0 - f) * F_up_clear   + (f) * F_up_cloud
-            F_down_avg = (1.0 - f) * F_down_clear + (f) * F_down_cloud
-            F_diff_avg = (1.0 - f) * F_diff_clear + (f) * F_diff_cloud
+            if f == 1:
+                F_net_avg  = F_net_cloud
+                F_up_avg   = F_up_cloud
+                F_down_avg = F_down_cloud
+                F_diff_avg = F_diff_cloud
+            
+            else:
+                # Weighted Average
+                F_net_avg  = (1.0 - f) * F_net_clear  + (f) * F_net_cloud
+                F_up_avg   = (1.0 - f) * F_up_clear   + (f) * F_up_cloud
+                F_down_avg = (1.0 - f) * F_down_clear + (f) * F_down_cloud
+                F_diff_avg = (1.0 - f) * F_diff_clear + (f) * F_diff_cloud
             
             # Push Averaged Fluxes back to GPU for the Temperature Stepper
             quant.dev_F_net = gpuarray.to_gpu(F_net_avg)
@@ -1018,8 +1106,21 @@ class Compute(object):
         condition2 = True
         condition3 = True
         quant.iter_value = np.int32(0)
-        quant.p_lay = quant.dev_p_lay.get()
-        quant.p_int = quant.dev_p_int.get()
+
+        quant.p_dry_lay = quant.dev_p_lay.get()
+        quant.p_dry_int = quant.dev_p_int.get()
+
+        h2o_species = None
+        for spec in quant.species_list:
+            if "H2O" in spec.name or "1H2-16O" in spec.name:
+                h2o_species = spec
+                break
+
+        quant.x_h2o_start = h2o_species.vmr_layer[0]
+
+        if quant.cloud_fraction == 0:
+            quant.clouds = np.int32(0)
+        quant.cloud_reduction_factor = np.float64(0)
 
         # measures the runtime of a specified number of iterations
         start_loop = cuda.Event()
@@ -1035,8 +1136,8 @@ class Compute(object):
 
         start_total.record()
 
-        if quant.clouds == 1:
-            quant.cloud_fraction = 0.6
+        quant.cloud_fraction = np.maximum(quant.cloud_fraction, 0)
+        quant.cloud_fraction = np.minimum(quant.cloud_fraction, 1)
 
         while condition1 and condition2 and condition3:
 
@@ -1054,7 +1155,8 @@ class Compute(object):
                     self.interpolate_meanmolmass(quant)
                 elif quant.opacity_mixing == "on-the-fly":
                     hsfunc.calculate_vmr_for_all_species(quant)
-                    self.apply_rainout(quant) # ADDED RAINOUT
+                    if quant.rainout == 1:
+                        self.apply_rainout(quant) # ADDED RAINOUT 
                     hsfunc.calculate_meanmolecularmass(quant)
                     hsfunc.nullify_opac_scat_arrays(quant)
                     self.calculate_total_opacity_and_scat_cross_sections_from_species(quant)
@@ -1085,12 +1187,6 @@ class Compute(object):
                 quant.marked_red = np.zeros(quant.nlayer+1)
 
                 if quant.iter_value % 100 == 0:
-                    h2o_species = None
-                    for spec in quant.species_list:
-                        if "H2O" in spec.name or "1H2-16O" in spec.name:
-                            h2o_species = spec
-                            break
-                    print(h2o_species.vmr_layer)
                     print("\nWe are running \"" + quant.name + "\" at iteration step nr. : "+str(quant.iter_value))
                     if quant.iter_value > 99:
                         print("Time for the last 100 steps [s]: {:.2f}".format(time_loop * 1e-3))
@@ -1234,12 +1330,13 @@ class Compute(object):
                 self.interpolate_temperatures(quant)
 
                 # interpolating and updating quantities needed for convective adjustment
-                if quant.iter_value % 10 == 0: # TODO can this chunk be executed only once at timestep 0?
+                if quant.iter_value == 0: # TODO can this chunk be executed only once at timestep 0?
                     if quant.opacity_mixing == "premixed":
                         self.interpolate_meanmolmass(quant)
                     elif quant.opacity_mixing == "on-the-fly":
                         hsfunc.calculate_vmr_for_all_species(quant)
-                        self.apply_rainout(quant) # ADDED RAINOUT
+                        # if quant.rainout == 1:
+                        #     self.apply_rainout(quant) # ADDED RAINOUT
                         hsfunc.calculate_meanmolecularmass(quant)
 
                 self.interpolate_kappa_and_cp(quant)
@@ -1263,7 +1360,8 @@ class Compute(object):
                         self.interpolate_meanmolmass(quant)
                     elif quant.opacity_mixing == "on-the-fly":
                         hsfunc.calculate_vmr_for_all_species(quant)
-                        self.apply_rainout(quant) # ADDED RAINOUT
+                        if quant.rainout == 1:
+                            self.apply_rainout(quant) # ADDED RAINOUT
                         hsfunc.calculate_meanmolecularmass(quant)
                         hsfunc.nullify_opac_scat_arrays(quant)
                         self.calculate_total_opacity_and_scat_cross_sections_from_species(quant)
@@ -1287,12 +1385,16 @@ class Compute(object):
                 quant.F_up_tot = quant.dev_F_up_tot.get()
                 quant.F_net_diff = quant.dev_F_net_diff.get()
 
+                if quant.clouds == 1 and quant.iter_value % 10 == 0 and quant.cloud_destruction == 1:
+                    self.apply_temperature_dependent_clouds(quant)
+
                 # required to mark convective zones
                 self.interpolate_kappa_and_cp(quant)
                 quant.kappa_lay = quant.dev_kappa_lay.get()
                 if quant.iso == 0:
                     quant.kappa_int = quant.dev_kappa_int.get()
-                hsfunc.apply_moist_physics(quant) # ADDED MOIST PHYSICS
+                if quant.moist_convection:
+                    hsfunc.apply_moist_physics(quant) # ADDED MOIST PHYSICS
                 quant.T_lay = quant.dev_T_lay.get()
 
                 # mark convection zone. used by realtime plotting
@@ -1308,12 +1410,6 @@ class Compute(object):
                 condition = not(hsfunc.check_for_radiative_eq(quant)) or (quant.iter_value < 400) or (sum(quant.conv_layer) == 0)
 
                 if quant.iter_value % 100 == 1:
-                    h2o_species = None
-                    for spec in quant.species_list:
-                        if "H2O" in spec.name or "1H2-16O" in spec.name:
-                            h2o_species = spec
-                            break
-                    print(h2o_species.vmr_layer)
                     hsfunc.give_feedback_on_convergence(quant)
 
                 # radiative forward stepping if local flux criterion not satisfied

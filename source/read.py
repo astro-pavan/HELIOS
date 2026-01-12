@@ -280,6 +280,13 @@ class Read(object):
         parser.add_argument('-cloud_bottom_pressure', help='see documentation (https://heliosexo.readthedocs.io/en/latest/)', required=False)
         parser.add_argument('-cloud_bottom_mixing_ratio', help='see documentation (https://heliosexo.readthedocs.io/en/latest/)', required=False)
         parser.add_argument('-cloud_to_gas_scale_height_ratio', help='see documentation (https://heliosexo.readthedocs.io/en/latest/)', required=False)
+        parser.add_argument('-cloud_cover', required=False)
+        parser.add_argument('-cloud_destruction', required=False)
+
+        parser.add_argument('-rainout', required=False)
+        parser.add_argument('-set_h2o_with_august_roche_magnus', required=False)
+        parser.add_argument('-relative_humidity', required=False)
+        parser.add_argument('-moist_convection', required=False)
 
         # photochemical kinetics coupling
         parser.add_argument('-coupling_mode', help='see documentation (https://heliosexo.readthedocs.io/en/latest/)', required=False)
@@ -517,6 +524,26 @@ class Read(object):
                         if cloud.cloud_mixing_ratio_setting == "manual":
                             for i in range(cloud.nr_cloud_decks):
                                 cloud.cloud_to_gas_scale_height.append(npy.float64(column[9 + i]))
+
+                    elif column[0] == "cloud" and column[1] == "cover":
+                        quant.cloud_fraction = npy.float64(column[3])
+
+                    elif column[0] == "cloud" and column[1] == "destruction":
+                        quant.cloud_destruction = self.__read_yes_no__(column[3])
+
+                    # moist physics
+
+                    elif column[0] == "rainout":
+                        quant.rainout = self.__read_yes_no__(column[2])
+
+                    elif column[0] == "set" and column[5] == "magnus":
+                        quant.august_roche_magnus = self.__read_yes_no__(column[7])
+
+                    elif column[0] == "relative" and column[1] == "humidity":
+                        quant.relative_humidity = npy.float64(column[3])
+
+                    elif column[0] == "moist" and column[1] == "convection":
+                        quant.moist_convection = self.__read_yes_no__(column[3])
 
                     # photochemical kinetics coupling
                     elif column[0] == "coupling" and column[1] == "mode":
@@ -786,6 +813,12 @@ class Read(object):
         if args.cloud_to_gas_scale_height_ratio:
             cloud.cloud_to_gas_scale_height = [npy.float64(args.cloud_to_gas_scale_height_ratio)]
 
+        if args.cloud_cover:
+            quant.cloud_fraction = npy.float64(args.cloud_cover)
+
+        if args.cloud_destruction:
+            quant.cloud_destruction = self.__read_yes_no__(args.cloud_destruction)
+
         # photochemical kinetics coupling
         if args.coupling_mode:
             quant.coupling = self.__read_yes_no__(args.coupling_mode)
@@ -801,6 +834,20 @@ class Read(object):
 
         if args.coupling_iteration_step:
             quant.coupling_iter_nr = npy.int32(args.coupling_iteration_step)
+
+        # moist physics
+
+        if args.rainout:
+            quant.rainout = self.__read_yes_no__(args.rainout)
+
+        if args.relative_humidity:
+            quant.relative_humidity = npy.float64(args.relative_humidity)
+
+        if args.moist_convection:
+            quant.moist_convection = self.__read_yes_no__(args.moist_convection)
+
+        if args.set_h2o_with_august_roche_magnus:
+            quant.august_roche_magnus = self.__read_yes_no__(args.set_h2o_with_august_roche_magnus)
 
         #########################
         ### advanced settings ###

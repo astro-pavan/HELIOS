@@ -539,7 +539,8 @@ def convective_adjustment(quant):
 
     iter = 0
 
-    apply_moist_physics(quant) # ADDED MOIST CONVECTION
+    if quant.moist_convection:
+        apply_moist_physics(quant) # ADDED MOIST CONVECTION
 
     conv_check(quant)
     unstable_found = sum(quant.conv_unstable) > 0
