@@ -825,6 +825,33 @@ class Compute(object):
 
         cuda.Context.synchronize()
 
+    def ice_ocean_albedo_feedback(self, quant):
+        """
+        Custom Physics: Ice albedo feedback. 
+        """
+
+        T_melt = 280
+        T_freeze = 260
+
+        alb_ice = 0.5
+        alb_ocean = 0.05
+        alb = 0
+
+        T_int = quant.dev_T_int.get()
+        T_surf = T_int[0]
+
+        if T_surf > T_melt:
+            alb = alb_ocean
+        elif T_surf > T_freeze and T_surf <= T_melt:
+            alb = alb_ice + (alb_ocean - alb_ice) * (T_surf - T_freeze) / (T_melt - T_freeze)
+        else:
+            alb = alb_ice
+
+        # sets albedo
+        quant.surf_albedo = np.ones(quant.nbin) * alb
+
+        quant.dev_surf_albedo = gpuarray.to_gpu(quant.surf_albedo)
+
     def apply_rainout(self, quant):
         """
         Custom Physics: Manabe-Wetherald Rainout (Fixed Relative Humidity).
@@ -926,11 +953,12 @@ class Compute(object):
             if quant.iter_value % 100 == 0:
                 print(new_vmr)
                 print(f"\n[Variable Pressure Debug] Iteration {quant.iter_value}")
-                print(f"  Surface Temp:   {T_lay[0]:.2f} K")
+                print(f"  Surface Temp:   {T_int[0]:.2f} K")
                 print(f"  x_H2O (Surf):   {x_h2o_max[0]:.4f}")
                 print(f"  P_H2O (Steam):  {P_sat_bar:.4f} bar")
                 print(f"  P_dry (Steam):  {P_dry_bar:.4f} bar")
                 print(f"  P_total (Surf): {P_bar_current:.4f} bar")
+                print(f"  Albedo: {quant.surf_albedo[0]:.3f}")
 
                 net_flux_toa = quant.dev_F_net.get()[-1]
                 print(f"  Net Flux TOA: {net_flux_toa:.4e} erg/s/cm2 (Pos=Cooling, Neg=Heating)")
@@ -992,6 +1020,8 @@ class Compute(object):
 
     def radiation_with_partial_clouds(self, quant):
         """ does the raditaive calculation with partial clouds"""
+
+        self.ice_ocean_albedo_feedback(quant)
 
         if quant.clouds == 1:
             

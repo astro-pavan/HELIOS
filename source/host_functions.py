@@ -199,9 +199,9 @@ def initial_temp(quant, read):
                 + quant.dir_beam * abs(quant.mu_star) ** 0.25 * (quant.R_star / quant.a) ** 0.5 * quant.T_star
 
         # for efficiency reasons initial temperature has a lower limit of 500 K
-        quant.T_lay = np.ones(quant.nlayer+1) * max(T_eff, 200)
+        quant.T_lay = np.ones(quant.nlayer+1) * max(T_eff, 300)
 
-        print("\nStarting with an isothermal TP-profile at {:g}".format(max(T_eff, 200))+" K.")
+        print("\nStarting with an isothermal TP-profile at {:g}".format(max(T_eff, 300))+" K.")
 
     elif quant.singlewalk == 1 or (quant.force_start_tp_from_file == 1 and quant.physical_tstep != 0):
 
